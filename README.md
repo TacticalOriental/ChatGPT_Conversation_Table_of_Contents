@@ -24,9 +24,7 @@ The indicator shows up to 15 pills in very long conversations. The panel still c
 
 ### Option 1: Install from Greasy Fork
 
-**Greasy Fork link coming soon.**
-
-<!-- GREASY_FORK_URL: replace the line above with the script listing link after publication. -->
+[Install ChatGPT Conversation Table of Contents](https://greasyfork.org/en/scripts/601750-chatgpt-conversation-table-of-contents)
 
 ### Option 2: Install manually from GitHub
 
