@@ -4,6 +4,26 @@ Bring back a quiet, native-style table of contents for ChatGPT conversations. Ho
 
 Works with short and long conversations, in light and dark mode. The prompt index loads without scrolling the conversation or moving your reading position.
 
+## Preview
+
+### Collapsed — stays out of the way
+
+A small stack of pills sits at the center-right edge while you read. The brighter pill marks your current section of the conversation.
+
+![ChatGPT conversation with the collapsed prompt indicator at the center-right edge](screenshots/TOC_Closed.png)
+
+### Expanded — find a prompt at a glance
+
+Hover over the indicator to reveal a compact list of your prompts. Click the prompt you recognize to return to that part of the conversation.
+
+![Expanded table of contents showing the beginnings of user prompts](screenshots/TOC_Opened.png)
+
+### Scroll — browse without losing your place
+
+Scroll inside the contents panel to browse earlier prompts while the conversation stays in place. The panel scrolls independently until you choose a prompt to jump to.
+
+![The contents panel scrolled to earlier prompts while the conversation remains in the same position](screenshots/TOC_Scroll.png)
+
 ## Features
 
 - A subtle, equal-length pill indicator at the center-right edge of the viewport
@@ -35,7 +55,7 @@ The indicator shows up to 15 pills in very long conversations. The panel still c
 
 You can also use the [direct installation link](https://raw.githubusercontent.com/TacticalOriental/ChatGPT_Conversation_Table_of_Contents/main/ChatGPT_Conversation_Table_of_Contents.user.js).
 
-If automatic installation does not open, copy the entire [plain-text mirror](ChatGPT_Conversation_Table_of_Contents.txt) into a new script in your userscript manager and save.
+If automatic installation does not open, copy the entire [plain-text mirror](https://github.com/TacticalOriental/ChatGPT_Conversation_Table_of_Contents/releases/download/v2.0.0/ChatGPT_Conversation_Table_of_Contents.txt) into a new script in your userscript manager and save.
 
 When replacing an earlier personal or development copy, disable that copy before installing this public version, then reload your open ChatGPT tabs. Keep one TOC script enabled.
 
@@ -115,12 +135,11 @@ The script is standalone; Node is needed only for local checks. With Node 18 or 
 ```sh
 node --check ChatGPT_Conversation_Table_of_Contents.user.js
 node --test tests/toc.test.cjs
-cmp ChatGPT_Conversation_Table_of_Contents.user.js ChatGPT_Conversation_Table_of_Contents.txt
 ```
 
 The release includes 44 focused tests for extraction, pagination, recovery, cancellation, active-section mapping, focus state, route changes, and cleanup. These use isolated DOM/network fixtures and do not contact ChatGPT. They do not replace an installed-browser integration test.
 
-`ChatGPT_Conversation_Table_of_Contents.user.js` is the canonical source. After editing it, regenerate the text mirror with:
+`ChatGPT_Conversation_Table_of_Contents.user.js` is the canonical source; the plain-text fallback is published as a release asset. After editing the source, generate that text copy with:
 
 ```sh
 cp ChatGPT_Conversation_Table_of_Contents.user.js ChatGPT_Conversation_Table_of_Contents.txt
