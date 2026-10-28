@@ -86,11 +86,13 @@ function environment({ expose = true, pathname = '/' } = {}) {
   const body = new Element('body');
   const document = {
     body,
+    get activeElement() { return focused?.element ?? body; },
     events: new Map(),
     addEventListener(name, fn) { if (!this.events.has(name)) this.events.set(name, []); this.events.get(name).push(fn); },
     removeEventListener(name, fn) { this.events.set(name, (this.events.get(name) || []).filter((x) => x !== fn)); },
     getElementById(id) { return body.children.find((node) => node.id === id) ?? null; },
     createElement: (tag) => new Element(tag),
+    createElementNS: (_ns, tag) => new Element(tag),
     createDocumentFragment: () => new Element('fragment'),
     querySelectorAll: (selector) => body.querySelectorAll(selector),
     querySelector: (selector) => body.querySelector(selector),
@@ -116,11 +118,11 @@ function environment({ expose = true, pathname = '/' } = {}) {
     cancelAnimationFrame(id) { frames.delete(id); },
     getComputedStyle: (element) => ({ flexDirection: element.direction ?? 'column', overflowY: 'auto' }),
     matchMedia: () => ({ matches: true }),
-    URL, URLSearchParams, Headers, AbortController, DOMException, TypeError,
+    URL, URLSearchParams, Headers, AbortController, DOMException, TypeError, performance,
     fetch: async () => { throw new Error('Unexpected network call in fixture'); },
   });
   const executable = expose ? source.replace(/if \(document.body\) (?:new App\(\)\.start\(\)|bootstrap\(\));/,
-    'globalThis.probe = { CONFIG, normalizeText, collectPromptText, promptsFromMessages, legacyActiveBranch, mergeRenderedPrompts, routeContext, ConversationSource, ChatGPTRequest, HttpError, App, TocView, ActiveTurnTracker, DomTurns };') : source;
+    'globalThis.probe = { CONFIG, SEARCH, PromptSearch, searchDocument, boundedEditDistance, wordMatchScore, searchPreview, cachedPreviewMeasure, normalizeText, collectPromptText, promptsFromMessages, legacyActiveBranch, mergeRenderedPrompts, routeContext, ConversationSource, ChatGPTRequest, HttpError, App, TocView, ActiveTurnTracker, DomTurns };') : source;
   vm.runInContext(executable, context);
   return { context, probe: context.probe, document, window, location, Element, listeners, observers, timers, timerDelays, frames, focused: () => focused, rerun: () => vm.runInContext(source, context) };
 }
@@ -799,4 +801,739 @@ test('a refreshed authoritative edit replaces old full text without trusting the
   await app.refreshData();
   assert.equal(app.sourceItems[0].text, 'Complete edited prompt, including its ending');
   assert.equal(e.probe.mergeRenderedPrompts(app.sourceItems, [{ id: 'same-id', text: 'Complete edited prompt' }])[0].text, app.sourceItems[0].text);
+});
+
+async function findPrompts(texts, query) {
+  const e = environment();
+  const search = new e.probe.PromptSearch();
+  search.setItems(texts.map((text, i) => ({ id: String(i), text })));
+  const results = await drive(search.find(query), e);
+  return { e, search, results: plain(results) };
+}
+
+async function finishQuery(view, e, value) {
+  view.setQuery(value);
+  view.searchSoon.cancel();
+  if (view.query) await drive(view.runSearch(), e);
+}
+
+const displayedIds = (view) => plain(view.entries).map(({ item }) => item.id);
+
+function descendantText(node) {
+  return (node.textContent || '') + node.children.map(descendantText).join('');
+}
+
+test('search ignores casing, accents, repeated whitespace, and punctuation; all terms are required', async () => {
+  const texts = ['A CAFÉ in Montréal with résumé tips', 'Tire-pressure in winter', 'Pressure on a bicycle tire', 'A tire and no matching term'];
+  assert.deepEqual((await findPrompts(texts, 'cafe   resume')).results.map(r => r.item.id), ['0']);
+  assert.deepEqual((await findPrompts(texts, '  PRESSURE\nTIRE ')).results.map(r => r.item.id), ['1', '2']);
+  assert.deepEqual((await findPrompts(texts, 'tire nonexistent')).results, []);
+});
+
+test('search tolerates transpositions, substitutions, insertions and deletions at conservative lengths', async () => {
+  const text = 'Discuss battery voltage and maintenance';
+  for (const query of ['battrey', 'batery', 'batttery', 'battary', 'voltge', 'maintenacne', 'maintanence']) {
+    const { results } = await findPrompts([text, 'A fully unrelated topic about books'], query);
+    assert.deepEqual(results.map(r => r.item.id), ['0'], query);
+  }
+  assert.deepEqual((await findPrompts([text], 'bttr')).results, []);
+  assert.deepEqual((await findPrompts(['cat', 'dog', 'car', 'battery'], 'car')).results.map(r => r.item.id), ['2']);
+});
+
+test('search supports word prefixes and missing/extra spaces without arbitrary substring noise', async () => {
+  for (const query of ['tirepressure', 'ti re pres sure', 'tirepressur', 'tire press']) {
+    assert.deepEqual((await findPrompts(['What about tire pressure?', 'How does a train work?'], query)).results.map(r => r.item.id), ['0'], query);
+  }
+  assert.deepEqual((await findPrompts(['A train is waiting', 'rain'], 'rain')).results.map(r => r.item.id), ['1']);
+  assert.deepEqual((await findPrompts(['The international topic'], 'inter')).results.map(r=>r.item.id), ['0'], 'a literal prefix must not depend on the complete word length');
+});
+
+test('numeric prefixes are progressive while numeric substitutions and code names stay precise', async () => {
+  const texts = ['Invoice 2025 amount 1000', 'Invoice 2026 amount 10001', 'C++ is distinct', 'C# is distinct'];
+  assert.deepEqual((await findPrompts(texts, '2025')).results.map(r => r.item.id), ['0']);
+  assert.deepEqual((await findPrompts(texts, '1000')).results.map(r => r.item.id), ['0','1']);
+  assert.deepEqual((await findPrompts(texts, '10001')).results.map(r => r.item.id), ['1']);
+  assert.deepEqual((await findPrompts(texts, '2027')).results, []);
+  assert.deepEqual((await findPrompts(texts, 'C++')).results.map(r => r.item.id), ['2']);
+  assert.deepEqual((await findPrompts(texts, 'C#')).results.map(r => r.item.id), ['3']);
+});
+
+test('bounded edit distance agrees with an independent full-matrix OSA oracle', () => {
+  const { probe } = environment();
+  function oracle(a, b) {
+    a = Array.from(a); b = Array.from(b);
+    const matrix = Array.from({ length: a.length + 1 }, (_, i) => Array.from({ length: b.length + 1 }, (_, j) => i ? (j ? 0 : i) : j));
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + Number(a[i - 1] !== b[j - 1]));
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) matrix[i][j] = Math.min(matrix[i][j], matrix[i - 2][j - 2] + 1);
+    }
+    return matrix[a.length][b.length];
+  }
+  const words = ['','a','b','aa','ab','ba','abc','cab','battery','battrey','maintenacne','maintenance','é𐐷ab','éa𐐷b'];
+  for (const a of words) for (const b of words) for (const limit of [0,1,2]) {
+    assert.equal(probe.boundedEditDistance(a, b, limit), Math.min(oracle(a,b), limit + 1), `${a}/${b}/${limit}`);
+  }
+});
+
+test('search reaches the end of complete long prompts and preserves chronology and original text', async () => {
+  const long = 'Introduction and the original beginning. ' + 'ordinary material '.repeat(6000) + 'Battery voltage in winter finally appears here.';
+  const { results } = await findPrompts(['A battery voltage question', 'Unrelated text', long], 'battrey voltge');
+  assert.deepEqual(results.map(r => r.item.id), ['0', '2']);
+  assert.equal(results[1].item.text, long);
+  assert.ok(results[1].ranges.every(range => range.start > 100000));
+});
+
+test('Unicode matches highlight original source offsets after normalization and around emoji', async () => {
+  for (const [text, query, expected] of [
+    ['👩‍💻 Please compare CAFÉ ideas', 'cafe', 'CAFÉ'],
+    ['A Straße in Germany', 'strasse', 'Straße'],
+    ['Some e\u0301tude music', 'etude', 'e\u0301tude'],
+    ['轮胎压力为什么会随温度变化？', '压力', '压力'],
+  ]) {
+    const { results } = await findPrompts([text], query);
+    assert.equal(results.length, 1, query);
+    const r = results[0].ranges[0];
+    assert.equal(text.slice(r.start, r.end), expected);
+  }
+});
+
+test('preview uses continuous relevant context and inserts highlight text safely', async () => {
+  const text = 'I would like to understand this carefully before making a decision. <img src=x onerror=alert(1)> Please explain battery voltage in winter.';
+  const { e, results } = await findPrompts([text], 'voltge');
+  const view = new e.probe.TocView(() => {});
+  const preview = view.makePreview(results[0].item, results[0].ranges);
+  assert.ok(descendantText(preview).includes('voltage'));
+  const marks = preview.children.filter(n => n.tag === 'mark');
+  assert.equal(marks.map(descendantText).join(''), 'voltage');
+  assert.ok(preview.children.every(n => ['span', 'mark'].includes(n.tag)));
+  assert.equal(preview.querySelector('.tm-cgpt-toc__search-lead'), null);
+  assert.equal(view.makePreview({text:'<script>alarm</script> battery'}, []).textContent, '<script>alarm</script> battery');
+});
+
+test('filtering changes only panel contents, preserving full rail mapping, panel height and navigation identity', async () => {
+  const e = environment();
+  const selected = [];
+  const view = new e.probe.TocView(id => selected.push(id));
+  const data = items(50).map((item, i) => ({ ...item, text: i === 40 ? 'Battery voltage in winter' : 'Ordinary topic ' + i }));
+  view.render(data); view.setActive('p49'); view.setOpen(true); view.setSearchVisible(true);
+  const height = view.dock.properties.get('--tm-cgpt-toc-panel-height');
+  const rail = view.railList.children.slice();
+  await finishQuery(view, e, 'battrey');
+  assert.deepEqual(displayedIds(view), ['p40']);
+  assert.equal(view.items.length, 50);
+  assert.equal(view.railSlot, 14);
+  assert.equal(view.railList.children.length, 15);
+  assert.ok(rail.every((row, i) => row === view.railList.children[i]));
+  assert.equal(view.dock.properties.get('--tm-cgpt-toc-panel-height'), height);
+  const button = view.panelById.get('p40').firstElementChild;
+  view.dock.events.get('click')[0]({target:button});
+  assert.deepEqual(selected, ['p40']);
+  assert.equal(view.query, '');
+  assert.equal(view.searchVisible, false);
+});
+
+test('zero results keep panel geometry, contain wheel events and distinguish incomplete history', async () => {
+  const e = environment();
+  const view = new e.probe.TocView(() => {});
+  view.render(items(20)); view.setOpen(true);
+  const height = view.dock.properties.get('--tm-cgpt-toc-panel-height');
+  await finishQuery(view,e,'completely unrelated');
+  assert.deepEqual(displayedIds(view), []);
+  assert.equal(view.emptyNotice.textContent, 'No matching prompts');
+  assert.equal(view.dock.properties.get('--tm-cgpt-toc-panel-height'), height);
+  let prevented = 0;
+  view.onWheel({deltaY:100, deltaMode:0, preventDefault(){prevented++;}});
+  assert.equal(prevented, 1);
+  view.onWheel({deltaY:100, ctrlKey:true, preventDefault(){prevented++;}});
+  assert.equal(prevented, 1, 'Ctrl-wheel should retain browser zoom');
+  view.setStatus('loading');
+  assert.equal(view.emptyNotice.textContent,'No matches in loaded prompts');
+  view.setStatus('complete');
+  assert.equal(view.emptyNotice.textContent,'No matching prompts');
+});
+
+test('clearing restores independent list position; closing restores default UI on next entry', async () => {
+  const e = environment();
+  const view = new e.probe.TocView(() => {});
+  view.render(items(100)); view.setActive('p50'); view.setOpen(true); view.setSearchVisible(true);
+  view.panel.scrollTop = 812;
+  await finishQuery(view,e,'Prompt 3');
+  view.setQuery('');
+  assert.equal(view.panel.scrollTop,812);
+  assert.equal(view.entries.length,100);
+  await finishQuery(view,e,'Prompt 4');
+  view.setOpen(false);
+  assert.equal(view.query,'');
+  assert.equal(view.searchField.inert,true);
+  assert.equal(view.searchField.getAttribute('aria-hidden'),'true');
+  assert.equal(view.searchVisible,false);
+  view.setOpen(true);
+  assert.equal(view.entries.length,100);
+  assert.equal(view.panel.scrollTop, 50*46+6+23-167);
+});
+
+test('new queries and route clear reject delayed old results even if a dependency ignores cancellation', async () => {
+  const e = environment();
+  const view = new e.probe.TocView(() => {});
+  view.render([{id:'old',text:'battery'}, {id:'new',text:'pressure'}]); view.setOpen(true);
+  let resolve;
+  view.search.find = () => new Promise(r => {resolve=r;});
+  view.setQuery('battery'); view.searchSoon.cancel(); const old = view.runSearch();
+  view.setQuery('pressure'); view.searchSoon.cancel();
+  resolve([{item:{id:'old',text:'battery'},ranges:[]}]); await old;
+  assert.equal(view.query,'pressure');
+  assert.equal(view.searchPending,true);
+  const pending = view.runSearch();
+  view.clear(); resolve([{item:{id:'old',text:'battery'},ranges:[]}]); await pending;
+  assert.equal(view.host.hidden,true);
+  assert.equal(view.entries.length,0);
+  assert.equal(view.query,'');
+  assert.equal(e.timers.size,0);
+});
+
+test('active search reconciles prepends, new prompts, authoritative edits and removed branches', async () => {
+  const e = environment(); const view = new e.probe.TocView(() => {});
+  view.render([{id:'a',text:'battery voltage'}]); view.setOpen(true);
+  await finishQuery(view,e,'battery');
+  view.render([{id:'older',text:'An earlier battery prompt'},{id:'a',text:'Edited pressure prompt'},{id:'b',text:'A new battery prompt'}]);
+  view.searchSoon.cancel(); await drive(view.runSearch(),e);
+  assert.deepEqual(displayedIds(view),['older','b']);
+  assert.equal(view.search.documents.has('a'),true);
+  view.render([{id:'a',text:'Edited pressure prompt'}]);
+  view.searchSoon.cancel(); await drive(view.runSearch(),e);
+  assert.deepEqual(displayedIds(view),[]);
+  assert.equal(view.search.documents.has('older'),false);
+  assert.equal(view.search.documents.has('b'),false);
+});
+
+test('IME input waits for committed text and equivalent input does not restart work', async () => {
+  const e = environment(); const view = new e.probe.TocView(() => {});
+  view.render([{id:'a',text:'轮胎压力'}]); view.setOpen(true);
+  view.searchInput.events.get('compositionstart')[0]();
+  view.searchInput.value = '压';
+  view.searchInput.events.get('input')[0]({isComposing:true});
+  assert.equal(view.query,'');
+  view.searchInput.value = '压力';
+  view.searchInput.events.get('compositionend')[0]();
+  assert.equal(view.query,'压力');
+  const sequence = view.searchSequence;
+  view.searchInput.events.get('input')[0]({isComposing:false});
+  assert.equal(view.searchSequence,sequence);
+  view.searchSoon.cancel(); await drive(view.runSearch(),e);
+  assert.deepEqual(displayedIds(view),['a']);
+});
+
+test('intentional search hover readies typing while ordinary TOC hover keeps composer focus', async () => {
+  const e = environment(); const view = new e.probe.TocView(() => {});
+  view.render([{id:'a',text:'battery'},{id:'b',text:'pressure'}]); view.setOpen(true);
+  const composer = new e.Element('textarea'); composer.focus();
+  view.dock.events.get('pointerenter')[0]();
+  assert.equal(e.focused().element,composer);
+  view.searchButton.events.get('pointerenter')[0]();
+  assert.equal(view.searchVisible,true);
+  assert.equal(e.focused().element,view.searchInput);
+  view.searchButton.events.get('click')[0]();
+  assert.equal(e.focused().element,view.searchInput);
+  await finishQuery(view,e,'pressure');
+  const event = {target:view.searchInput,key:'ArrowDown',preventDefault(){},stopPropagation(){}};
+  view.dock.events.get('keydown')[0](event);
+  assert.equal(e.focused().element.dataset.messageId,'b');
+  view.dock.events.get('keydown')[0]({...event,key:'Escape'});
+  assert.equal(view.query,'');
+  assert.equal(view.open,true);
+  assert.equal(e.focused().element,view.searchInput);
+  view.dock.events.get('keydown')[0]({...event,key:'Escape'});
+  assert.equal(view.open,false);
+});
+
+test('destroy cancels a debounced search and releases its lazy index', async () => {
+  const e = environment(); const view = new e.probe.TocView(() => {});
+  view.render([{id:'a',text:'battery'}]); view.setOpen(true);
+  await finishQuery(view,e,'battery');
+  assert.equal(view.search.documents.size,1);
+  view.setQuery('pressure');
+  assert.equal(e.timers.size,1);
+  view.destroy();
+  assert.equal(e.timers.size,0);
+  assert.equal(view.search.documents.size,0);
+  assert.equal(view.entries.length,0);
+});
+
+test('partial remembered words work in every query position, not only the last term', async () => {
+  assert.deepEqual((await findPrompts(['A battery voltage question','An unrelated volleyball question'], 'batt volt')).results.map(r=>r.item.id), ['0']);
+});
+
+test('cancellation checkpoints apply inside one huge prompt and incomplete indexing is not cached', async () => {
+  const e = environment();
+  let ticks = 0;
+  e.context.performance = {now:()=>++ticks};
+  const search = new e.probe.PromptSearch();
+  search.setItems([{id:'huge',text:'ordinary material '.repeat(20000)+'battery voltage'}]);
+  const controller = new AbortController();
+  const pending = search.find('battery',controller.signal);
+  assert.ok(e.timers.size > 0, 'one long prompt did not yield during indexing');
+  controller.abort();
+  await assert.rejects(pending,{name:'AbortError'});
+  assert.equal(e.timers.size,0);
+  assert.equal(search.documents.size,0);
+  const result = await drive(search.find('battrey voltge'), e);
+  assert.equal(result.length,1);
+  assert.equal(result[0].item.id,'huge');
+  assert.equal(search.documents.size,1);
+});
+
+test('unexpected search failure is truthful and clearing/retrying restores normal operation', async () => {
+  const e = environment();
+  let diagnostics = 0;
+  e.context.console = {warn(){diagnostics++;}};
+  const view = new e.probe.TocView(() => {});
+  view.render([{id:'a',text:'battery'},{id:'b',text:'pressure'}]); view.setOpen(true);
+  const original = view.search.find.bind(view.search);
+  view.search.find = async () => {throw new TypeError('fixture failure');};
+  await finishQuery(view,e,'battery');
+  assert.equal(view.emptyNotice.textContent,'Search unavailable');
+  assert.equal(view.searchPending,false);
+  assert.equal(diagnostics,1);
+  view.setQuery('');
+  assert.deepEqual(displayedIds(view),['a','b']);
+  view.search.find = original;
+  await finishQuery(view,e,'battery');
+  assert.deepEqual(displayedIds(view),['a']);
+  assert.equal(view.searchError,false);
+});
+
+test('search pending results cannot activate an old prompt and no search operation sends a network request', async () => {
+  const e = environment(); let navigations=0;
+  const view = new e.probe.TocView(()=>navigations++);
+  view.render([{id:'a',text:'battery'},{id:'b',text:'pressure'}]); view.setOpen(true);
+  const oldButton = view.panelById.get('a').firstElementChild;
+  view.setQuery('pressure');
+  assert.equal(view.panelList.getAttribute('aria-busy'),'true');
+  view.dock.events.get('click')[0]({target:oldButton});
+  assert.equal(navigations,0);
+  view.searchSoon.cancel(); await drive(view.runSearch(),e);
+  assert.equal(view.panelList.getAttribute('aria-busy'),'false');
+  assert.deepEqual(displayedIds(view),['b']);
+  assert.equal(e.timers.size,0);
+});
+
+test('typed literal prefixes match from two characters with no word-length ratio gate', async () => {
+  for (const [word, sequence] of [
+    ['text',['te','tex','text']],
+    ['magnification',['ma','mag','magn','magni','magnif','magnifi','magnific','magnifica','magnificat','magnificati','magnificatio','magnification']],
+    ['international',['in','int','inte','inter','intern','interna','internat','internati','internatio','internation','internationa','international']],
+  ]) for (const prefix of sequence) {
+    assert.deepEqual((await findPrompts(['Discuss '+word,'Entirely unrelated reading'],prefix)).results.map(r=>r.item.id),['0'],prefix);
+  }
+});
+
+test('numeric and letter prefixes remain matched across ignored quote and space boundaries', async () => {
+  for (const text of ['roughly a size 32” DDD','roughly a size 32\u2033\u00a0DDD','roughly a size 32 DDD','roughly a size 32DDD','roughly a size 32-ddd']) {
+    for (const query of ['32','32d','32dd','32ddd','32 d','32 dd','32 ddd']) {
+      assert.deepEqual((await findPrompts([text,'roughly a size 34 DDD'],query)).results.map(r=>r.item.id),['0'],text+' / '+query);
+    }
+  }
+});
+
+test('multi-term partial words work in either order and stay matched as the last term starts', async () => {
+  for (const query of ['ba vo','batt v','batt vo','batt vol','battery volt','vo ba']) {
+    assert.deepEqual((await findPrompts(['Battery voltage in winter','A battery warranty question','Volleyball shoes'],query)).results.map(r=>r.item.id),['0'],query);
+  }
+});
+
+test('one-character input keeps the full default list without building a search index', async () => {
+  for (const query of ['t','3','é','压','!']) {
+    const {results,search} = await findPrompts(['text','Battery voltage'],query);
+    assert.deepEqual(results.map(r=>r.item.id),['0','1'],query);
+    assert.ok(results.every(r=>r.ranges.length===0));
+    assert.equal(search.documents.size,0);
+  }
+});
+
+
+function fireCloseTimer(view,e) {
+  const fn=e.timers.get(view.closeTimer);
+  assert.ok(fn,'expected an owned close-delay timer');
+  e.window.clearTimeout(view.closeTimer);
+  fn();
+}
+
+test('an unused hover-focused search closes on leaving and restores the prior composer without scrolling', () => {
+  const e=environment(); const view=new e.probe.TocView(()=>{});
+  const composer=new e.Element('textarea'); composer.focus();
+  view.render(items(20));
+  view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('pointerenter')[0]();
+  assert.equal(e.focused().element,view.searchInput);
+  assert.equal(e.focused().options.preventScroll,true);
+  view.dock.events.get('pointerleave')[0]();
+  fireCloseTimer(view,e);
+  assert.equal(view.open,false);
+  assert.equal(e.focused().element,composer);
+  assert.equal(e.focused().options.preventScroll,true);
+  assert.equal(view.hoverFocus,null);
+  assert.equal(e.timers.size,0);
+});
+
+test('typing engages search so leaving the hover region does not interrupt it; external focus can close it', async () => {
+  const e=environment(); const view=new e.probe.TocView(()=>{});
+  view.render([{id:'a',text:'text preview'},{id:'b',text:'battery'}]);
+  view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('pointerenter')[0]();
+  view.searchInput.value='te';
+  view.searchInput.events.get('input')[0]({isComposing:false});
+  view.searchSoon.cancel(); await drive(view.runSearch(),e);
+  assert.equal(view.hoverFocus,null);
+  view.dock.events.get('pointerleave')[0](); fireCloseTimer(view,e);
+  assert.equal(view.open,true);
+  assert.deepEqual(displayedIds(view),['a']);
+  const outside=new e.Element('textarea'); outside.focus();
+  view.dock.events.get('focusout')[0]({relatedTarget:outside}); fireCloseTimer(view,e);
+  assert.equal(view.open,false);
+  assert.equal(e.focused().element,outside);
+  assert.equal(view.query,'');
+});
+
+test('reentering the shared hover region cancels closure; Escape returns an unused hover focus', () => {
+  const e=environment(); const view=new e.probe.TocView(()=>{});
+  const composer=new e.Element('textarea'); composer.focus();
+  view.render(items(20)); view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('pointerenter')[0]();
+  view.dock.events.get('pointerleave')[0]();
+  view.dock.events.get('pointerenter')[0]();
+  assert.equal(e.timers.size,0);
+  assert.equal(view.open,true);
+  view.dock.events.get('keydown')[0]({target:view.searchInput,key:'Escape',preventDefault(){},stopPropagation(){}});
+  assert.equal(view.open,false);
+  assert.equal(e.focused().element,composer);
+  assert.equal(view.hoverFocus,null);
+});
+
+test('clearing or destroying a hover-focused view releases focus ownership and retained nodes', () => {
+  for(const action of ['clear','destroy']) {
+    const e=environment(); const view=new e.probe.TocView(()=>{});
+    const composer=new e.Element('textarea'); composer.focus();
+    view.render(items(20)); view.dock.events.get('pointerenter')[0]();
+    view.searchButton.events.get('pointerenter')[0]();
+    view[action]();
+    assert.equal(e.focused().element,composer,action);
+    assert.equal(view.hoverFocus,null,action);
+    assert.equal(e.timers.size,0,action);
+  }
+});
+
+test('one-character input keeps current panel nodes and reading-centered scroll; backspacing restores browsing position', async () => {
+  const e=environment(); const view=new e.probe.TocView(()=>{});
+  view.render(items(100)); view.setActive('p50'); view.setOpen(true);
+  const first=view.panelList.firstElementChild;
+  const scroll=view.panel.scrollTop;
+  view.setQuery('p');
+  assert.equal(view.searchPending,false);
+  assert.equal(view.panelList.firstElementChild,first);
+  assert.equal(view.panel.scrollTop,scroll);
+  assert.equal(e.timers.size,0);
+  await finishQuery(view,e,'Prompt 3');
+  view.setQuery('p');
+  assert.equal(view.entries.length,100);
+  assert.equal(view.panel.scrollTop,scroll);
+  assert.equal(view.searchPending,false);
+});
+
+test('progressive literal matching maps highlighted original characters across normalization and separators', async () => {
+  for(const [text,query,expected] of [
+    ['Some TEXT here','te','TE'],
+    ['Original 32” DDD detail','32d','32” D'],
+    ['Original 32” DDD detail','32dd','32” DD'],
+    ['A CAFÉ example','ca','CA'],
+    ['An e\u0301tude example','et','e\u0301t'],
+    ['A ﬁle example','fi','ﬁ'],
+    ['A Straße example','stras','Straß'],
+  ]) {
+    const {results}=await findPrompts([text],query);
+    assert.equal(results.length,1,query);
+    const range=results[0].ranges[0];
+    assert.equal(text.slice(range.start,range.end),expected,query);
+  }
+});
+
+test('literal prefix evidence beats a fuzzy word when both are available for a term', async () => {
+  const text='Can you explain the fairly commonplace change in chromatography and carrier charging performance?';
+  const {results}=await findPrompts([text],'charg perf');
+  assert.equal(results.length,1);
+  const sourceMatches=results[0].ranges.map(r=>text.slice(r.start,r.end));
+  assert.ok(sourceMatches.includes('charg'));
+  assert.ok(sourceMatches.includes('perf'));
+  assert.ok(!sourceMatches.includes('change'));
+});
+
+test('actual input-handler sequences keep target rows continuously available while typing and backspacing', async () => {
+  for(const [target,sequence] of [
+    ['The text within the panel needs work',['t','te','tex','text','tex','te','t','']],
+    ['A sizing question, roughly a size 32” DDD',['3','32','32d','32dd','32ddd','32dd','32d','32','3','']],
+  ]) {
+    const e=environment();const view=new e.probe.TocView(()=>{});
+    view.render([{id:'target',text:target},{id:'other',text:'Unrelated topic'}]);
+    view.setActive('target');view.setOpen(true);view.setSearchVisible(true);
+    const height=view.dock.properties.get('--tm-cgpt-toc-panel-height');
+    for(const value of sequence) {
+      view.searchInput.value=value;
+      view.searchInput.events.get('input')[0]({isComposing:false});
+      if(view.searchPending) {view.searchSoon.cancel();await drive(view.runSearch(),e);}
+      const ids=displayedIds(view);
+      assert.equal(ids.filter(id=>id==='target').length,1,value);
+      assert.equal(view.panelById.get('target').firstElementChild.getAttribute('aria-label'),target);
+      assert.equal(view.dock.properties.get('--tm-cgpt-toc-panel-height'),height,value);
+      assert.equal(view.railList.children.length,2,value);
+      assert.equal(view.searchPending,false,value);
+    }
+  }
+});
+
+test('nearby search hits read as one continuous source preview without duplicated opening words', async () => {
+  const text='ok 1. let’s do a full robustness/standards check with the now standardized md, and retain all intended functionality.';
+  const {e,results}=await findPrompts([text],'robustness');
+  const view=new e.probe.TocView(()=>{});
+  const preview=view.makePreview(results[0].item,results[0].ranges);
+  const shown=descendantText(preview);
+  assert.ok(shown.startsWith('ok 1. let’s do a full robustness/standards check'),shown);
+  assert.equal((shown.match(/full/g)||[]).length,1);
+  assert.equal(shown.includes('…'),false,'short source text needs no manufactured omission');
+  assert.equal(preview.querySelector('.tm-cgpt-toc__search-lead'),null);
+});
+
+test('unused search retracts when leaving its own area while the contents panel stays open', () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.render(items(20));view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('pointerenter')[0]();
+  assert.equal(view.searchVisible,true);
+  const leave=view.searchShelf.events.get('pointerleave')?.[0];
+  assert.equal(typeof leave,'function','search needs its own hover lifecycle');
+  leave();
+  const fn=e.timers.get(view.searchRetractTimer);
+  assert.ok(fn,'empty search should schedule its own retraction');
+  e.window.clearTimeout(view.searchRetractTimer);fn();
+  assert.equal(view.searchVisible,false);
+  assert.equal(view.open,true);
+});
+
+const monoMetrics = (width) => ({width, measure: (value) => Array.from(value).length * 7});
+
+function matchRanges(text, terms) {
+  return terms.map(term=>({start:text.indexOf(term),end:text.indexOf(term)+term.length})).sort((a,b)=>a.start-b.start);
+}
+
+function fireRetraction(view,e) {
+  const fn=e.timers.get(view.searchRetractTimer);
+  assert.ok(fn,'expected a search retraction timer');
+  e.window.clearTimeout(view.searchRetractTimer);fn();
+}
+
+test('short and beginning-hit previews retain one intact source run without invented omissions', () => {
+  const e=environment();
+  for(const text of ['Robustness first.','A quick robustness check.','ok 1. let’s do a full robustness/standards check.']) {
+    const result=e.probe.searchPreview(text,matchRanges(text,['robustness'].map(x=>text.startsWith('R')?'Robustness':x)),monoMetrics(292));
+    assert.equal(result.start,0,text);
+    assert.equal(result.end,text.length,text);
+  }
+});
+
+test('excerpt selection adapts to width, and distant hits do not spend a line on unrelated opening text', () => {
+  const e=environment();
+  const text='Before making a practical decision, can you explain the robustness of this design in ordinary language?';
+  const ranges=matchRanges(text,['robustness']);
+  const broad=e.probe.searchPreview(text,ranges,monoMetrics(360));
+  const narrow=e.probe.searchPreview(text,ranges,monoMetrics(140));
+  assert.equal(broad.start,0);
+  assert.ok(narrow.start>0);
+  assert.ok(narrow.start<=ranges[0].start && narrow.end>=ranges[0].end);
+  const late='An unrelated introduction. '+('ordinary discussion '.repeat(300))+'The overall robustness stays useful under UI changes.';
+  const selected=e.probe.searchPreview(late,matchRanges(late,['robustness']),monoMetrics(292));
+  assert.ok(selected.start>5000);
+  assert.ok(late.slice(selected.start,selected.end).includes('robustness stays useful'));
+});
+
+test('preview favors a useful nearby cluster of search terms while retaining all source text in the model', () => {
+  const e=environment();
+  const text='Battery appears at the beginning. '+('unrelated filler '.repeat(80))+'Voltage and charging are explained together at the end.';
+  const ranges=matchRanges(text,['Battery','Voltage','charging']);
+  const selected=e.probe.searchPreview(text,ranges,monoMetrics(292));
+  const shown=text.slice(selected.start,selected.end);
+  assert.ok(shown.includes('Voltage and charging'));
+  assert.ok(!shown.includes('Battery appears at the beginning'));
+  const view=new e.probe.TocView(()=>{});
+  view.render([{id:'same-id',text}]);
+  view.renderPanelEntries([{item:{id:'same-id',text},ranges}]);
+  assert.equal(view.items[0].text,text);
+  assert.equal(view.panelById.get('same-id').firstElementChild.getAttribute('aria-label'),text);
+});
+
+test('unbroken and Unicode excerpts retain the hit without splitting a grapheme at the display boundary', () => {
+  const e=environment();
+  const long='robustness'+('x'.repeat(1000));
+  const selected=e.probe.searchPreview(long,matchRanges(long,['robustness']),monoMetrics(120));
+  assert.equal(selected.start,0);
+  assert.ok(selected.end>10 && selected.end<long.length);
+  const text='robustness '+('a'.repeat(497))+'👩‍💻'+('x'.repeat(100));
+  const part=e.probe.searchPreview(text,matchRanges(text,['robustness']),monoMetrics(292));
+  const boundaries=new Set(Array.from(new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(text),p=>p.index));
+  boundaries.add(text.length);
+  assert.ok(boundaries.has(part.end),'preview ended inside a Unicode grapheme');
+});
+
+test('empty mouse-clicked search still retracts, and rapid re-entry cancels that retraction', () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.render(items(20));view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('pointerenter')[0]();
+  view.searchField.events.get('pointerdown')[0]();
+  assert.equal(view.searchSessionStarted,false);
+  view.searchShelf.events.get('pointerleave')[0]();
+  assert.ok(view.searchRetractTimer);
+  view.searchShelf.events.get('pointerenter')[0]();
+  assert.equal(view.searchRetractTimer,0);
+  assert.equal(view.searchVisible,true);
+  view.searchShelf.events.get('pointerleave')[0]();fireRetraction(view,e);
+  assert.equal(view.searchVisible,false);
+  assert.equal(view.searchField.inert,true);
+  assert.equal(view.open,true);
+});
+
+test('typing pins search for this panel session, including a cleared query; closing resets the session', async () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.render([{id:'a',text:'robustness check'},{id:'b',text:'other'}]);
+  view.dock.events.get('pointerenter')[0]();view.searchButton.events.get('pointerenter')[0]();
+  view.searchInput.value='ro';view.searchInput.events.get('input')[0]({isComposing:false});
+  view.searchSoon.cancel();await drive(view.runSearch(),e);
+  view.searchShelf.events.get('pointerleave')[0]();
+  assert.equal(view.searchRetractTimer,0);
+  assert.equal(view.searchVisible,true);
+  view.clearButton.events.get('click')[0]();
+  assert.equal(view.query,'');
+  assert.equal(view.searchSessionStarted,true);
+  view.searchShelf.events.get('pointerleave')[0]();
+  assert.equal(view.searchRetractTimer,0);
+  assert.equal(view.searchVisible,true);
+  view.setOpen(false);
+  assert.equal(view.searchSessionStarted,false);
+  assert.equal(view.searchVisible,false);
+  view.setOpen(true);view.searchButton.events.get('pointerenter')[0]();
+  view.searchShelf.events.get('pointerleave')[0]();fireRetraction(view,e);
+  assert.equal(view.searchVisible,false);
+});
+
+test('composition and explicit keyboard activation keep search usable independently of the mouse', () => {
+  for(const mode of ['keyboard','composition']) {
+    const e=environment();const view=new e.probe.TocView(()=>{});
+    view.render(items(20));view.setOpen(true);
+    if(mode==='keyboard')view.searchButton.events.get('click')[0]({detail:0});
+    else {view.searchButton.events.get('pointerenter')[0]();view.searchInput.events.get('compositionstart')[0]();}
+    view.searchShelf.events.get('pointerleave')[0]();
+    if(view.searchRetractTimer)fireRetraction(view,e);
+    assert.equal(view.searchVisible,true,mode);
+    assert.equal(e.focused().element,view.searchInput,mode);
+    assert.equal(view.searchField.inert,false,mode);
+  }
+});
+
+test('an unused keyboard field retracts after focus returns to the prompt list', () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.render(items(20));view.dock.events.get('pointerenter')[0]();
+  view.searchButton.events.get('click')[0]({detail:0});
+  view.searchShelf.events.get('pointerleave')[0]();fireRetraction(view,e);
+  assert.equal(view.searchVisible,true,'keep explicit keyboard focus usable');
+  const prompt=view.panelList.firstElementChild.firstElementChild;
+  prompt.focus({preventScroll:true});
+  const focusout=view.searchField.events.get('focusout')?.[0];
+  assert.equal(typeof focusout,'function','unused search needs to follow focus leaving its field');
+  focusout({relatedTarget:prompt});fireRetraction(view,e);
+  assert.equal(view.searchVisible,false);
+  assert.equal(view.open,true);
+  assert.equal(e.focused().element,prompt);
+});
+
+test('preview width honors valid zero padding instead of applying a missing-value fallback', () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.panel.clientWidth=300;
+  e.context.getComputedStyle=element=>element===view.previewProbe
+    ? {paddingLeft:'0px',paddingRight:'0px'}
+    : {fontSize:'14px',fontWeight:'400',fontFamily:'sans-serif',letterSpacing:'normal'};
+  assert.equal(view.previewMetrics().width,300-2*e.probe.CONFIG.panelPaddingPx);
+});
+
+test('blur-triggered focusout cannot recreate a retraction timer during hiding or teardown', () => {
+  for(const action of ['hide','destroy']) {
+    const e=environment();const view=new e.probe.TocView(()=>{});
+    view.render(items(20));view.setOpen(true);view.searchButton.events.get('pointerenter')[0]();
+    view.pointerInSearch=false;
+    const blur=view.searchInput.blur.bind(view.searchInput);
+    view.searchInput.blur=()=>{
+      blur();
+      view.searchField.events.get('focusout')[0]({relatedTarget:null});
+    };
+    if(action==='hide')view.setSearchVisible(false);
+    else view.destroy();
+    assert.equal(view.searchRetractTimer,0,action);
+    assert.equal(e.timers.size,0,action);
+  }
+});
+
+test('retracting an unused field restores outside focus without moving the panel scroll position', () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  const composer=new e.Element('textarea');composer.focus();
+  view.render(items(100));view.setActive('p50');view.dock.events.get('pointerenter')[0]();
+  const scroll=view.panel.scrollTop;
+  view.searchButton.events.get('pointerenter')[0]();
+  view.searchShelf.events.get('pointerleave')[0]();fireRetraction(view,e);
+  assert.equal(e.focused().element,composer);
+  assert.equal(e.focused().options.preventScroll,true);
+  assert.equal(view.panel.scrollTop,scroll);
+  assert.equal(view.open,true);
+});
+
+test('resize refreshes only preview spans, keeping prompt buttons, focus and independent scroll', async () => {
+  const e=environment();const view=new e.probe.TocView(()=>{});
+  view.render([{id:'a',text:'Before making a practical decision, can you explain the robustness of this design in ordinary language?'},{id:'b',text:'other'}]);
+  view.setOpen(true);view.setSearchVisible(true);
+  await finishQuery(view,e,'robustness');
+  const button=view.panelById.get('a').firstElementChild;
+  const preview=button.firstElementChild;
+  button.focus();view.panel.scrollTop=21;
+  let measurements=0;
+  view.previewMetrics=()=>{measurements++;return monoMetrics(140);};
+  view.resize();
+  assert.equal(button.firstElementChild,preview);
+  const timer=Array.from(e.timers).find(([id])=>e.timerDelays.get(id)===e.probe.SEARCH.previewResizeDelayMs);
+  assert.ok(timer);e.window.clearTimeout(timer[0]);timer[1]();
+  assert.equal(measurements,1);
+  assert.equal(view.panelById.get('a').firstElementChild,button);
+  assert.notEqual(button.firstElementChild,preview);
+  assert.equal(e.focused().element,button);
+  assert.equal(view.panel.scrollTop,21);
+});
+
+test('font readiness subscription and new UI timers are owned and released on teardown', () => {
+  const e=environment();const callbacks=new Set();
+  e.document.fonts={addEventListener(_name,fn){callbacks.add(fn);},removeEventListener(_name,fn){callbacks.delete(fn);}};
+  const view=new e.probe.TocView(()=>{});
+  assert.equal(callbacks.size,1);
+  view.render(items(20));view.setOpen(true);view.searchButton.events.get('pointerenter')[0]();
+  view.searchShelf.events.get('pointerleave')[0]();
+  view.setQuery('Prompt');view.resize();
+  assert.ok(e.timers.size>=2);
+  view.destroy();
+  assert.equal(callbacks.size,0);
+  assert.equal(e.timers.size,0);
+  assert.equal(view.previewContext,null);
+});
+
+test('font measurement reuse distinguishes highlights and does not cross render/font contexts', () => {
+  const {probe}=environment();let calls=0;
+  const first=probe.cachedPreviewMeasure((text,highlighted)=>{calls++;return text.length*(highlighted?9:7);});
+  assert.equal(first('term'),28);
+  assert.equal(first('term',true),36);
+  assert.equal(first('term'),28);
+  assert.equal(first('term',true),36);
+  assert.equal(calls,2);
+  const next=probe.cachedPreviewMeasure(text=>text.length*11);
+  assert.equal(next('term'),44);
+  assert.equal(first('term'),28);
 });

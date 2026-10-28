@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Conversation Table of Contents
 // @namespace    https://github.com/TacticalOriental/ChatGPT_Conversation_Table_of_Contents
-// @version      2.0.0
-// @description  A quiet, native-feeling prompt index for every ChatGPT conversation.
+// @version      2.1.3
+// @description  Native-style prompt navigation for ChatGPT, with optional typo-tolerant search.
 // @author       TacticalOriental
 // @license      MIT
 // @match        https://chatgpt.com/*
@@ -742,6 +742,397 @@
     ));
   }
 
+  // Literal prefixes and typo tolerance have separate policies. Short typed
+  // prefixes are useful immediately; approximate spelling needs more evidence.
+  const SEARCH = Object.freeze({
+    inputMaxLength: 160,
+    debounceMs: 35,
+    sliceBudgetMs: 8,
+    fuzzyMinLength: 5,
+    twoEditMinLength: 8,
+    fuzzyMaxLength: 64,
+    minQueryLength: 2,
+    previewSourceLimit: 512,
+    previewMeasureCacheLimit: 2048,
+    previewResizeDelayMs: 80,
+    revealMs: 120,
+    retractDelayMs: 80,
+    toggleHitWidthPx: 48,
+    shelfHeightPx: 42,
+  });
+
+  function foldSearchWord(value) {
+    return value.normalize('NFKD').toLowerCase()
+      .replace(/\p{M}/gu, '').replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+  }
+
+  function* buildSearchDocument(text) {
+    const tokens = [];
+    let compact = '';
+    // Keep +/# attached to names such as C++ and C#. Punctuation and spacing
+    // otherwise separate words; original UTF-16 offsets are used for display.
+    for (const match of text.matchAll(/[\p{L}\p{N}\p{M}]+[+#]*/gu)) {
+      const key = foldSearchWord(match[0]);
+      if (!key) continue;
+      tokens.push({ key, start: match.index, end: match.index + match[0].length,
+        offset: compact.length });
+      compact += key;
+      if (tokens.length % 256 === 0) yield;
+    }
+    return { text, tokens, compact };
+  }
+
+  function searchDocument(text) {
+    const work = buildSearchDocument(text);
+    let step = work.next();
+    while (!step.done) step = work.next();
+    return step.value;
+  }
+
+  function isSearchQuery(query) {
+    return Array.from(query.compact).length >= SEARCH.minQueryLength;
+  }
+
+  // Banded optimal-string-alignment distance (Damerau–Levenshtein variant):
+  // insertion, deletion, substitution and adjacent transposition. The narrow
+  // band bounds fuzzy work; it is never used to reject an exact long word.
+  function boundedEditDistance(left, right, limit) {
+    const a = Array.from(left);
+    const b = Array.from(right);
+    if (Math.abs(a.length - b.length) > limit) return limit + 1;
+    let older = null;
+    let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i += 1) {
+      const row = new Array(b.length + 1).fill(limit + 1);
+      row[0] = i;
+      let minimum = row[0];
+      for (let j = Math.max(1, i - limit); j <= Math.min(b.length, i + limit); j += 1) {
+        row[j] = Math.min(row[j - 1] + 1, previous[j] + 1,
+          previous[j - 1] + Number(a[i - 1] !== b[j - 1]));
+        if (older && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+          row[j] = Math.min(row[j], older[j - 2] + 1);
+        }
+        minimum = Math.min(minimum, row[j]);
+      }
+      if (minimum > limit) return limit + 1;
+      older = previous;
+      previous = row;
+    }
+    return Math.min(previous[b.length], limit + 1);
+  }
+
+  function wordMatchScore(query, word) {
+    if (query === word) return 0;
+    if (word.startsWith(query)) return 0.25;
+    if (!/^\p{L}+$/u.test(query) || !/^\p{L}+$/u.test(word)) return Infinity;
+    const length = Array.from(query).length;
+    if (length < SEARCH.fuzzyMinLength || length > SEARCH.fuzzyMaxLength
+      || word.length > SEARCH.fuzzyMaxLength * 2) return Infinity;
+    const limit = length >= SEARCH.twoEditMinLength ? 2 : 1;
+    if (Math.abs(Array.from(word).length - length) > limit) return Infinity;
+    const distance = boundedEditDistance(query, word, limit);
+    return distance <= limit ? 1 + distance / length : Infinity;
+  }
+
+  function mergeMatchRanges(ranges) {
+    const result = [];
+    for (const range of ranges.slice().sort((a, b) => a.start - b.start)) {
+      const last = result.at(-1);
+      if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
+      else result.push({ start: range.start, end: range.end });
+    }
+    return result;
+  }
+
+  function compactTokenIndex(doc, position) {
+    let low = 0;
+    let high = doc.tokens.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >>> 1;
+      if (doc.tokens[mid].offset <= position) low = mid + 1;
+      else high = mid - 1;
+    }
+    return high;
+  }
+
+  function sourceKeyRange(text, token, from, to) {
+    const raw = text.slice(token.start, token.end);
+    if (raw.length === token.key.length && (raw === token.key || raw.toLowerCase() === token.key)) {
+      return { start: token.start + from, end: token.start + to };
+    }
+    // Map only the matched part, retaining complete original characters and
+    // combining marks when normalization expands a ligature or removes accents.
+    let cursor = token.start;
+    let folded = 0;
+    let start = null;
+    let end = cursor;
+    for (const character of raw) {
+      const width = foldSearchWord(character).length;
+      if (width && folded >= to) break;
+      if (width && folded + width > from && start === null) start = cursor;
+      if (folded < to || (!width && start !== null)) end = cursor + character.length;
+      folded += width;
+      cursor += character.length;
+    }
+    return { start: start ?? token.start, end };
+  }
+
+  function compactMatchRange(doc, offset, end) {
+    const first = doc.tokens[compactTokenIndex(doc, offset)];
+    const last = doc.tokens[compactTokenIndex(doc, end - 1)];
+    if (first === last) return sourceKeyRange(doc.text, first,
+      offset - first.offset, end - first.offset);
+    return {
+      start: sourceKeyRange(doc.text, first, offset - first.offset, first.key.length).start,
+      end: sourceKeyRange(doc.text, last, 0, end - last.offset).end,
+    };
+  }
+
+  function* literalSearchRange(doc, query) {
+    // Start at a word boundary, but allow the typed query to end anywhere.
+    // Compact text crosses punctuation/spacing, so 32d stays a prefix of 32” DDD.
+    // Scripts without word spacing also support an internal literal substring.
+    const internal = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u.test(query.compact);
+    let offset = doc.compact.indexOf(query.compact);
+    let checked = 0;
+    while (offset >= 0) {
+      const first = compactTokenIndex(doc, offset);
+      if (internal || doc.tokens[first].offset === offset) {
+        return [compactMatchRange(doc, offset, offset + query.compact.length)];
+      }
+      const next = doc.tokens[first + 1]?.offset;
+      if (next === undefined) break;
+      offset = doc.compact.indexOf(query.compact, next);
+      if (++checked % 256 === 0) yield;
+    }
+    return null;
+  }
+
+  function* matchSearchDocument(doc, query, comparisons) {
+    const literal = yield* literalSearchRange(doc, query);
+    if (literal) return literal;
+    const ranges = [];
+    let checked = 0;
+    for (let q = 0; q < query.tokens.length; q += 1) {
+      const key = query.tokens[q].key;
+      let best = null;
+      let bestScore = Infinity;
+      const scores = comparisons[q];
+      for (let t = 0; t < doc.tokens.length; t += 1) {
+        const token = doc.tokens[t];
+        // A joined pair handles a typo together with a missing space.
+        const candidates = [{ key: token.key, end: token.end }];
+        if (key.length >= SEARCH.fuzzyMinLength && doc.tokens[t + 1]) {
+          candidates.push({ key: token.key + doc.tokens[t + 1].key, end: doc.tokens[t + 1].end });
+        }
+        for (const candidate of candidates) {
+          let score = scores.get(candidate.key);
+          if (score === undefined) {
+            score = wordMatchScore(key, candidate.key);
+            scores.set(candidate.key, score);
+          }
+          if (score < bestScore) {
+            bestScore = score;
+            best = candidate.key.startsWith(key)
+              ? compactMatchRange(doc, token.offset, token.offset + key.length)
+              : { start: token.start, end: candidate.end };
+          }
+        }
+        if (bestScore === 0) break;
+        if (++checked % 256 === 0) yield;
+      }
+      if (!best) return null;
+      ranges.push(best);
+    }
+    return ranges;
+  }
+
+  class PromptSearch {
+    constructor() {
+      this.items = [];
+      this.documents = new Map();
+    }
+
+    setItems(items) {
+      this.items = items.slice();
+      const current = new Map(items.map((item) => [item.id, item.text]));
+      for (const [id, doc] of this.documents) {
+        if (current.get(id) !== doc.text) this.documents.delete(id);
+      }
+    }
+
+    clear() {
+      this.items = [];
+      this.documents.clear();
+    }
+
+    async find(value, signal) {
+      const query = searchDocument(value);
+      if (!isSearchQuery(query)) {
+        return this.items.map((item) => ({ item, ranges: [] }));
+      }
+      const items = this.items;
+      const results = [];
+      // Query-local comparisons are shared across repeated vocabulary, then
+      // released. The only persistent cache belongs to this conversation.
+      const comparisons = query.tokens.map(() => new Map());
+      let sliceStarted = performance.now();
+      // Generators checkpoint both indexing and matching inside a single
+      // unusually long prompt, as well as between ordinary prompts.
+      const complete = async (work) => {
+        let step = work.next();
+        while (!step.done) {
+          throwIfAborted(signal);
+          if (performance.now() - sliceStarted >= SEARCH.sliceBudgetMs) {
+            await cancellableDelay(0, signal);
+            sliceStarted = performance.now();
+          }
+          step = work.next();
+        }
+        return step.value;
+      };
+      for (const item of items) {
+        throwIfAborted(signal);
+        let doc = this.documents.get(item.id);
+        if (!doc) {
+          doc = await complete(buildSearchDocument(item.text));
+          throwIfAborted(signal);
+          this.documents.set(item.id, doc);
+        }
+        const ranges = await complete(matchSearchDocument(doc, query, comparisons));
+        if (ranges) results.push({ item, ranges: mergeMatchRanges(ranges) });
+        if (performance.now() - sliceStarted >= SEARCH.sliceBudgetMs) {
+          await cancellableDelay(0, signal);
+          sliceStarted = performance.now();
+        }
+      }
+      throwIfAborted(signal);
+      return results;
+    }
+  }
+
+  const PREVIEW_WORDS = typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+  const PREVIEW_GRAPHEMES = typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+  const PREVIEW_SENTENCES = typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, { granularity: 'sentence' }) : null;
+
+  function cachedPreviewMeasure(measure) {
+    // One cache per render/font measurement context. It is discarded after
+    // that operation, so fonts, size and spacing never inherit old widths.
+    const widths = new Map();
+    return (value, highlighted = false) => {
+      const key = `${Number(highlighted)}\u0000${value}`;
+      if (widths.has(key)) return widths.get(key);
+      const width = measure(value, highlighted);
+      if (widths.size < SEARCH.previewMeasureCacheLimit) widths.set(key, width);
+      return width;
+    };
+  }
+
+  function searchPreview(text, ranges, metrics) {
+    if (!ranges.length) return { start: 0, end: text.length };
+    const width = Math.max(24, metrics.width - metrics.measure('… '));
+    const measured = (start, end) => {
+      let cursor = start;
+      let total = 0;
+      for (const range of ranges) {
+        const a = Math.max(start, range.start);
+        const b = Math.min(end, range.end);
+        if (b <= a) continue;
+        total += metrics.measure(text.slice(cursor, a), false);
+        total += metrics.measure(text.slice(a, b), true);
+        cursor = b;
+      }
+      return total + metrics.measure(text.slice(cursor, end), false);
+    };
+    // Reserve room for an omission marker. Whole words wrap naturally; an
+    // oversized unbroken word may wrap anywhere, as in the preview's CSS.
+    const fits = (start, end) => {
+      if (end - start > SEARCH.previewSourceLimit) return false;
+      let line = 1;
+      let used = 0;
+      let gap = 0;
+      for (const unit of text.slice(start, end).matchAll(/\s+|\S+/gu)) {
+        const a = start + unit.index;
+        const advance = measured(a, a + unit[0].length);
+        if (/^\s/u.test(unit[0])) { gap = advance; continue; }
+        if (used + gap + advance <= width) used += gap + advance;
+        else if (advance <= width) { line += 1; used = advance; }
+        else {
+          if (used) line += 1;
+          const lines = Math.ceil(advance / width);
+          line += lines - 1;
+          used = advance - (lines - 1) * width;
+        }
+        gap = 0;
+        if (line > 2) return false;
+      }
+      return true;
+    };
+
+    // Prefer a cluster that shows more of a multi-term query. Ties retain the
+    // earlier context. There is one continuous source window, never a stitched
+    // opening plus a duplicate excerpt or a forced per-line template.
+    let anchor = { start: ranges[0].start, end: ranges[0].end, count: 1 };
+    for (let i = 0; i < ranges.length; i += 1) {
+      for (let j = i + 1; j < ranges.length; j += 1) {
+        if (!fits(ranges[i].start, ranges[j].end)) break;
+        if (j - i + 1 > anchor.count) {
+          anchor = { start: ranges[i].start, end: ranges[j].end, count: j - i + 1 };
+        }
+      }
+    }
+
+    let start = 0;
+    if (!fits(0, anchor.end)) {
+      start = anchor.start;
+      const lookbehind = Math.max(0, anchor.start - SEARCH.previewSourceLimit);
+      const before = text.slice(lookbehind, anchor.start);
+      const starts = PREVIEW_WORDS
+        ? Array.from(PREVIEW_WORDS.segment(before))
+          .filter((part) => part.isWordLike).map((part) => part.index)
+        : Array.from(before.matchAll(/\S+/gu), (part) => part.index);
+      const hitWidth = anchor.end - anchor.start > SEARCH.previewSourceLimit
+        ? width : measured(anchor.start, anchor.end);
+      const contextBudget = Math.min(width * .45, Math.max(0, width - Math.min(hitWidth, width)));
+      for (let i = starts.length - 1; i >= 0; i -= 1) {
+        const candidate = lookbehind + starts[i];
+        // A bounded lookbehind can start inside a word: do not publish that
+        // artificial boundary as a readable excerpt start.
+        if (!starts[i] && lookbehind && /\S/u.test(text[lookbehind - 1])) continue;
+        if (measured(candidate, anchor.start) > contextBudget || !fits(candidate, anchor.end)) break;
+        start = candidate;
+      }
+      if (PREVIEW_SENTENCES && start < anchor.start) {
+        const context = text.slice(start, Math.min(text.length, anchor.end + 64));
+        const origin = start;
+        for (const sentence of PREVIEW_SENTENCES.segment(context)) {
+          if (origin + sentence.index > anchor.start) break;
+          // Avoid opening with the dangling tail of an unrelated sentence.
+          start = origin + sentence.index;
+        }
+      }
+    }
+
+    let end = Math.min(text.length, start + SEARCH.previewSourceLimit);
+    if (end < text.length) {
+      const space = text.lastIndexOf(' ', end);
+      if (space > Math.max(start, anchor.end)) end = space;
+      else if (PREVIEW_GRAPHEMES) {
+        const part = PREVIEW_GRAPHEMES.segment(text).containing(end);
+        end = part.index > start ? part.index : part.index + part.segment.length;
+      } else {
+        // Without grapheme segmentation, retain a whole unspaced word. CSS
+        // still bounds the visible result to two lines.
+        const nextSpace = text.indexOf(' ', end);
+        end = nextSpace < 0 ? text.length : nextSpace;
+      }
+    }
+    return { start, end };
+  }
+
   class TocView {
     constructor(onNavigate, onOpen = () => {}) {
       document.getElementById(`${NS}-root`)?.remove();
@@ -755,6 +1146,24 @@
       this.open = false;
       this.closeTimer = 0;
       this.pointerInside = false;
+      this.search = new PromptSearch();
+      this.entries = [];
+      this.query = '';
+      this.searchVisible = false;
+      this.hoverFocus = null;
+      this.searchSessionStarted = false;
+      this.pointerInSearch = false;
+      this.searchRetractTimer = 0;
+      this.searchPending = false;
+      this.searchController = null;
+      this.searchSequence = 0;
+      this.loadStatus = 'idle';
+      this.destroyed = false;
+      this.searchSoon = createDebouncer(() => this.runSearch(), SEARCH.debounceMs);
+      this.previewRefreshSoon = createDebouncer(() => this.refreshPreviews(), SEARCH.previewResizeDelayMs);
+      this.onFontsReady = () => {
+        if (this.hasSearchQuery()) this.previewRefreshSoon();
+      };
 
       this.host = document.createElement('div');
       this.host.id = `${NS}-root`;
@@ -782,9 +1191,76 @@
       this.panelList.className = `${NS}__panel-list`;
       this.panel.append(this.panelList);
 
-      this.dock.append(this.panel, this.rail);
+      this.createSearchShelf();
+      this.dock.append(this.panel, this.rail, this.searchShelf);
+      this.announcer = document.createElement('span');
+      this.announcer.className = `${NS}__sr-only`;
+      this.announcer.setAttribute('role', 'status');
+      this.announcer.setAttribute('aria-live', 'polite');
+      this.dock.append(this.announcer);
+      this.previewProbe = document.createElement('button');
+      this.previewProbe.type = 'button';
+      this.previewProbe.className = `${NS}__panel-item`;
+      this.previewProbe.hidden = true;
+      this.previewProbe.tabIndex = -1;
+      this.previewProbe.setAttribute('aria-hidden', 'true');
+      const probeText = document.createElement('span');
+      probeText.className = `${NS}__preview`;
+      const probeMark = document.createElement('mark');
+      probeMark.textContent = 'M';
+      probeText.append(probeMark);
+      this.previewProbe.append(probeText);
+      this.dock.append(this.previewProbe);
       this.shadow.append(this.dock);
       this.bindEvents();
+      document.fonts?.addEventListener('loadingdone', this.onFontsReady);
+    }
+
+    searchIcon(clear = false) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('aria-hidden', 'true');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', clear ? 'm7 7 10 10M17 7 7 17'
+        : 'M20 20l-4.3-4.3M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z');
+      svg.append(path);
+      return svg;
+    }
+
+    createSearchShelf() {
+      this.searchShelf = document.createElement('div');
+      this.searchShelf.className = `${NS}__search-shelf`;
+      this.searchButton = document.createElement('button');
+      this.searchButton.type = 'button';
+      this.searchButton.className = `${NS}__search-toggle`;
+      this.searchButton.setAttribute('aria-label', 'Search Prompts');
+      this.searchButton.setAttribute('aria-expanded', 'false');
+      this.searchButton.setAttribute('aria-controls', `${NS}-search-field`);
+      this.searchButton.append(this.searchIcon());
+
+      this.searchField = document.createElement('div');
+      this.searchField.id = `${NS}-search-field`;
+      this.searchField.className = `${NS}__search-field`;
+      this.searchField.setAttribute('role', 'search');
+      this.searchField.inert = true;
+      this.searchField.setAttribute('aria-hidden', 'true');
+      this.searchInput = document.createElement('input');
+      this.searchInput.type = 'search';
+      this.searchInput.maxLength = SEARCH.inputMaxLength;
+      this.searchInput.placeholder = 'Search Prompts…';
+      this.searchInput.setAttribute('aria-label', 'Search conversation prompts');
+      this.searchInput.setAttribute('autocomplete', 'off');
+      this.searchInput.setAttribute('spellcheck', 'false');
+      this.searchInput.setAttribute('aria-controls', `${NS}-prompt-list`);
+      this.panelList.id = `${NS}-prompt-list`;
+      this.clearButton = document.createElement('button');
+      this.clearButton.type = 'button';
+      this.clearButton.className = `${NS}__search-clear`;
+      this.clearButton.setAttribute('aria-label', 'Clear search');
+      this.clearButton.hidden = true;
+      this.clearButton.append(this.searchIcon(true));
+      this.searchField.append(this.searchIcon(), this.searchInput, this.clearButton);
+      this.searchShelf.append(this.searchButton, this.searchField);
     }
 
     styles() {
@@ -810,6 +1286,9 @@
             ${CONFIG.panelWidthPx}px,
             calc(100vw - ${CONFIG.rightOffsetCss} - 18px)
           );
+          --${NS}-surface: color-mix(in srgb,
+            var(--color-surface-elevated-secondary, var(--color-token-main-surface-primary, #fff)) 97%, transparent);
+          --${NS}-border: color-mix(in srgb, var(--color-text-primary, #0d0d0d) 8%, transparent);
           position: absolute;
           top: 0;
           right: 0;
@@ -911,18 +1390,9 @@
           overscroll-behavior: contain;
           scrollbar-width: thin;
           scrollbar-color: color-mix(in srgb, var(--color-text-primary, #0d0d0d) 23%, transparent) transparent;
-          border: 1px solid color-mix(
-            in srgb, var(--color-text-primary, #0d0d0d) 8%, transparent
-          );
+          border: 1px solid var(--${NS}-border);
           border-radius: 12px;
-          background: color-mix(
-            in srgb,
-            var(
-              --color-surface-elevated-secondary,
-              var(--color-token-main-surface-primary, #fff)
-            ) 97%,
-            transparent
-          );
+          background: var(--${NS}-surface);
           box-shadow: 0 9px 28px rgb(0 0 0 / 13%);
           backdrop-filter: blur(14px);
           -webkit-backdrop-filter: blur(14px);
@@ -1012,9 +1482,192 @@
           );
         }
 
+        [hidden] { display: none !important; }
+
+        .${NS}__search-shelf {
+          --${NS}-toggle-top: 7px;
+          --${NS}-toggle-right: 4px;
+          position: absolute;
+          top: 100%;
+          right: 0;
+          width: 100%;
+          height: ${SEARCH.shelfHeightPx}px;
+          padding-top: 6px;
+          opacity: 0;
+          visibility: hidden;
+          pointer-events: none;
+          transition: opacity 110ms ease, visibility 0s linear ${CONFIG.transitionMs}ms;
+        }
+
+        .${NS}__dock--open .${NS}__search-shelf {
+          opacity: 1;
+          visibility: visible;
+          transition-delay: 0s;
+        }
+        .${NS}__dock--open .${NS}__search-shelf--expanded { pointer-events: auto; }
+
+        .${NS}__search-toggle, .${NS}__search-clear {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex: 0 0 32px;
+          width: 32px;
+          height: 32px;
+          padding: 7px;
+          margin-left: auto;
+          border: 0;
+          border-radius: 8px;
+          background: transparent;
+          color: var(--color-text-tertiary, #8f8f8f);
+          cursor: pointer;
+        }
+
+        .${NS}__search-toggle {
+          position: absolute;
+          top: var(--${NS}-toggle-top);
+          right: var(--${NS}-toggle-right);
+          margin: 0;
+          opacity: 0;
+          visibility: hidden;
+          pointer-events: none;
+          transition: opacity 70ms ease, visibility 0s linear 70ms;
+        }
+        /* Enlarge the existing button's hit area without moving or enlarging
+           its visible icon. The target stays within the search shelf. */
+        .${NS}__search-toggle::before {
+          content: '';
+          position: absolute;
+          top: calc(0px - var(--${NS}-toggle-top));
+          right: calc(0px - var(--${NS}-toggle-right));
+          width: min(${SEARCH.toggleHitWidthPx}px, var(--${NS}-panel-width));
+          height: ${SEARCH.shelfHeightPx}px;
+        }
+        .${NS}__dock--open .${NS}__search-toggle {
+          opacity: .8;
+          visibility: visible;
+          pointer-events: auto;
+          transition-delay: 0s;
+        }
+        .${NS}__dock--open .${NS}__search-shelf--expanded .${NS}__search-toggle {
+          opacity: 0;
+          visibility: hidden;
+          pointer-events: none;
+          transition-delay: 0s, 70ms;
+        }
+        .${NS}__search-shelf svg {
+          width: 16px;
+          height: 16px;
+          flex: 0 0 16px;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 1.65;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          pointer-events: none;
+        }
+
+        .${NS}__search-toggle:hover, .${NS}__search-clear:hover {
+          color: var(--color-text-primary, #0d0d0d);
+          background: color-mix(in srgb, currentColor 6%, transparent);
+        }
+
+        .${NS}__search-field {
+          position: absolute;
+          top: 6px;
+          right: 0;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          width: 40px;
+          height: 34px;
+          padding: 0 4px 0 11px;
+          overflow: hidden;
+          border: 1px solid var(--${NS}-border);
+          border-radius: 10px;
+          background: var(--${NS}-surface);
+          color: var(--color-text-tertiary, #8f8f8f);
+          box-shadow: 0 4px 14px rgb(0 0 0 / 7%);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          opacity: 0;
+          visibility: hidden;
+          pointer-events: none;
+          transition:
+            width ${SEARCH.revealMs}ms cubic-bezier(.2, .8, .2, 1),
+            opacity ${SEARCH.revealMs}ms ease,
+            visibility 0s linear ${SEARCH.revealMs}ms;
+        }
+        .${NS}__dock--open .${NS}__search-shelf--expanded .${NS}__search-field {
+          width: 100%;
+          opacity: 1;
+          visibility: visible;
+          pointer-events: auto;
+          transition-delay: 0s;
+        }
+
+        .${NS}__search-field input {
+          flex: 1 1 auto;
+          min-width: 0;
+          width: 100%;
+          height: 100%;
+          padding: 0;
+          border: 0;
+          outline: none;
+          background: transparent;
+          color: var(--color-text-primary, #0d0d0d);
+          font: inherit;
+          font-size: ${CONFIG.promptFontSizePx - 1}px;
+          appearance: none;
+          opacity: 1;
+          transition: none;
+        }
+
+        /* Gate the empty input, rather than animating ::placeholder itself.
+           Typing stops matching :placeholder-shown and reveals text at once.
+           Clearing an already open field keeps opacity 1, with no new wait. */
+        .${NS}__search-field input:placeholder-shown { opacity: 0; }
+        .${NS}__dock--open .${NS}__search-shelf--expanded .${NS}__search-field input:placeholder-shown {
+          opacity: 1;
+          transition: opacity 0s linear ${SEARCH.revealMs}ms;
+        }
+        .${NS}__search-field input::placeholder { color: var(--color-text-secondary, #5d5d5d); }
+        .${NS}__search-field input::-webkit-search-cancel-button { display: none; }
+        .${NS}__search-field:focus-within {
+          border-color: color-mix(in srgb, var(--color-text-primary, #0d0d0d) 18%, transparent);
+        }
+        .${NS}__search-toggle:focus-visible, .${NS}__search-clear:focus-visible {
+          outline: 1px solid color-mix(in srgb, var(--color-text-primary, #0d0d0d) 28%, transparent);
+          outline-offset: 2px;
+        }
+
+        .${NS}__panel-list[aria-busy="true"] .${NS}__panel-item { cursor: progress; }
+        .${NS}__preview mark {
+          color: var(--color-text-primary, #0d0d0d);
+          background: color-mix(in srgb, currentColor 10%, transparent);
+          border-radius: 3px;
+          font-weight: 600;
+        }
+        .${NS}__empty {
+          padding: 18px 12px;
+          color: var(--color-text-secondary, #5d5d5d);
+          font-size: ${CONFIG.promptFontSizePx - 1}px;
+          line-height: 20px;
+        }
+        .${NS}__sr-only {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          overflow: hidden;
+          clip-path: inset(50%);
+          white-space: nowrap;
+        }
+
         @media (prefers-reduced-motion: reduce) {
           .${NS}__rail, .${NS}__line, .${NS}__panel,
-          .${NS}__panel-item { transition: none; }
+          .${NS}__panel-item, .${NS}__search-shelf,
+          .${NS}__search-toggle, .${NS}__search-field,
+          .${NS}__dock--open .${NS}__search-shelf--expanded .${NS}__search-field input:placeholder-shown { transition: none; }
         }
       `;
     }
@@ -1023,6 +1676,7 @@
       this.dock.addEventListener('pointerenter', () => {
         this.pointerInside = true;
         window.clearTimeout(this.closeTimer);
+        this.closeTimer = 0;
         this.setOpen(true);
       });
 
@@ -1041,6 +1695,7 @@
 
       this.dock.addEventListener('focusin', (event) => {
         window.clearTimeout(this.closeTimer);
+        this.closeTimer = 0;
         this.setOpen(true);
         const button = event.target.closest?.(`.${NS}__rail-item, .${NS}__panel-item`);
         if (button) {
@@ -1058,23 +1713,87 @@
       });
 
       this.dock.addEventListener('focusout', (event) => {
-        if (!this.dock.contains(event.relatedTarget)) {
+        if (!this.dock.contains(event.relatedTarget) && !this.closeTimer) {
           this.scheduleClose();
         }
       });
 
       this.dock.addEventListener('wheel', (event) => this.onWheel(event), { passive: false });
 
+      this.searchShelf.addEventListener('pointerenter', () => {
+        this.pointerInSearch = true;
+        this.cancelSearchRetraction();
+      });
+      this.searchShelf.addEventListener('pointerleave', () => {
+        this.pointerInSearch = false;
+        this.scheduleSearchRetraction();
+      });
+      this.searchButton.addEventListener('pointerenter', () => this.revealSearchForPointer());
+      this.searchField.addEventListener('pointerenter', () => this.revealSearchForPointer());
+      this.searchField.addEventListener('pointerdown', () => {
+        if (!this.searchSessionStarted) this.hoverFocus ??= { previous: null };
+      });
+      this.searchField.addEventListener('focusout', (event) => {
+        if (!this.searchField.contains(event.relatedTarget) && !this.pointerInSearch) {
+          this.scheduleSearchRetraction();
+        }
+      });
+      this.searchButton.addEventListener('click', (event) => {
+        if (!event?.detail) this.hoverFocus = null;
+        else if (!this.searchSessionStarted) this.hoverFocus ??= { previous: null };
+        this.setSearchVisible(true, true);
+      });
+      this.searchInput.addEventListener('compositionstart', () => {
+        this.composing = true;
+        this.startSearchSession();
+      });
+      this.searchInput.addEventListener('compositionend', () => {
+        this.composing = false;
+        this.setQuery(this.searchInput.value);
+      });
+      this.searchInput.addEventListener('input', (event) => {
+        this.startSearchSession();
+        if (!event.isComposing && !this.composing) this.setQuery(this.searchInput.value);
+      });
+      this.clearButton.addEventListener('click', () => {
+        this.hoverFocus = null;
+        this.setQuery('');
+        this.searchInput.focus({ preventScroll: true });
+      });
+
       this.dock.addEventListener('keydown', (event) => {
+        if (event.isComposing || this.composing) return;
+        if (event.target === this.searchInput) {
+          // Do not let the host interpret typing/Enter as composer shortcuts.
+          event.stopPropagation();
+          if (event.key !== 'Escape') this.hoverFocus = null;
+          if (event.key === 'ArrowDown' || event.key === 'Enter') {
+            event.preventDefault();
+            if (!this.searchPending) {
+              this.ensurePromptVisible(0);
+              this.panelList.firstElementChild?.querySelector(`.${NS}__panel-item`)?.focus({ preventScroll: true });
+            }
+            return;
+          }
+        }
         if (event.key !== 'Escape') return;
-        this.setOpen(false);
-        this.shadow.activeElement?.blur();
+        event.preventDefault();
+        event.stopPropagation();
+        if (this.query) {
+          this.setQuery('');
+          this.searchInput.focus({ preventScroll: true });
+        } else {
+          this.releaseHoverFocus();
+          this.shadow.activeElement?.blur();
+          this.setOpen(false);
+        }
       });
 
       this.dock.addEventListener('click', (event) => {
         const button = event.target.closest?.(`.${NS}__rail-item, .${NS}__panel-item`);
         const id = button?.dataset.messageId;
-        if (!id) return;
+        if (!id || (this.searchPending && button.classList.contains(`${NS}__panel-item`))) return;
+        this.shadow.activeElement?.blur();
         this.setActive(id);
         this.setOpen(false);
         this.onNavigate(id);
@@ -1083,9 +1802,13 @@
 
     scheduleClose() {
       window.clearTimeout(this.closeTimer);
+      this.closeTimer = 0;
+      if (!this.open) return;
       this.closeTimer = window.setTimeout(() => {
         this.closeTimer = 0;
-        if (!this.pointerInside && !this.dock.contains(this.shadow.activeElement)) this.setOpen(false);
+        if (this.pointerInside) return;
+        this.releaseHoverFocus();
+        if (!this.dock.contains(this.shadow.activeElement)) this.setOpen(false);
       }, CONFIG.closeDelayMs);
     }
 
@@ -1100,7 +1823,8 @@
 
     setStatus(status) {
       this.host.dataset.state = status;
-      this.panel.setAttribute('aria-busy', String(status === 'loading'));
+      this.loadStatus = status;
+      this.updateSearchNotice();
       const notice = status === 'partial' ? 'Some conversation history could not be loaded.'
         : status === 'unavailable' ? 'Conversation history could not be loaded.' : '';
       this.panel.setAttribute('aria-label', notice ? `Conversation contents. ${notice}` : 'Conversation contents');
@@ -1112,9 +1836,19 @@
       if (!this.items.length) open = false;
       if (this.open === open) return;
       this.open = open;
+      if (!open) {
+        window.clearTimeout(this.closeTimer);
+        this.closeTimer = 0;
+        this.cancelSearchRetraction();
+        this.previewRefreshSoon.cancel();
+        this.searchSessionStarted = false;
+        this.pointerInSearch = false;
+      }
       this.dock.classList.toggle(`${NS}__dock--open`, open);
       for (const row of this.railList.children) row.firstElementChild.tabIndex = open ? -1 : 0;
       if (!open) {
+        this.setQuery('');
+        this.setSearchVisible(false);
         this.setHover(null);
       } else {
         const activeIndex = this.indexOf(this.activeId);
@@ -1136,12 +1870,18 @@
       this.signature = signature;
 
       const focusedId = this.shadow.activeElement?.dataset.messageId;
-      const topIndex = Math.floor(this.panel.scrollTop / CONFIG.panelRowHeightPx);
-      const topId = this.items[topIndex]?.id;
-      const topOffset = this.panel.scrollTop % CONFIG.panelRowHeightPx;
+      const anchor = this.panelAnchor();
       this.items = items.slice();
+      this.search.setItems(this.items);
 
       if (!this.items.length) {
+        this.cancelSearch();
+        this.query = '';
+        this.searchInput.value = '';
+        this.clearButton.hidden = true;
+        this.entries = [];
+        this.search.clear();
+        this.setSearchVisible(false);
         this.railList.replaceChildren();
         this.panelList.replaceChildren();
         this.panel.scrollTop = 0;
@@ -1151,6 +1891,7 @@
         this.highlightedRailRow = null;
         this.host.hidden = true;
         this.setOpen(false);
+        this.updateSearchNotice();
         return;
       }
 
@@ -1160,14 +1901,10 @@
 
       this.host.hidden = false;
       this.renderEntries();
-      if (topId) {
-        const nextIndex = this.indexOf(topId);
-        this.panel.scrollTop = nextIndex >= 0
-          ? nextIndex * CONFIG.panelRowHeightPx + topOffset
-          : 0;
-      }
+      this.restorePanelAnchor(anchor);
+      if (this.hasSearchQuery()) this.queueSearch(true);
       if (this.open && focusedId && this.panelById.has(focusedId)) {
-        this.ensurePromptVisible(this.indexOf(focusedId));
+        this.ensurePromptVisible(this.entries.findIndex(({ item }) => item.id === focusedId));
         this.panelById.get(focusedId).firstElementChild.focus({ preventScroll: true });
       }
     }
@@ -1206,9 +1943,6 @@
 
       const replaceRail = this.railList.children.length !== count;
       const railFragment = replaceRail ? document.createDocumentFragment() : null;
-      const panelFragment = document.createDocumentFragment();
-      const panelById = new Map();
-
       for (let slotIndex = 0; slotIndex < count; slotIndex += 1) {
         let railButton;
         if (replaceRail) {
@@ -1237,35 +1971,291 @@
         railButton.setAttribute('aria-label', railPrompt.text);
       }
 
-      for (const item of this.items) {
-        const panelRow = document.createElement('li');
-        panelRow.className = `${NS}__panel-row`;
-        const panelButton = document.createElement('button');
-        panelButton.type = 'button';
-        panelButton.className = `${NS}__panel-item`;
-        panelButton.dataset.messageId = item.id;
-        panelButton.setAttribute('aria-label', item.text);
-        const preview = document.createElement('span');
-        preview.className = `${NS}__preview`;
-        preview.textContent = item.text;
-        panelButton.append(preview);
-        panelRow.append(panelButton);
-        panelFragment.append(panelRow);
-        panelById.set(item.id, panelRow);
-      }
-
       if (replaceRail) this.railList.replaceChildren(railFragment);
-      this.panelList.replaceChildren(panelFragment);
-      this.panelById = panelById;
+      if (replaceRail) this.highlightedRailRow = null;
+      const valid = new Set(this.items.map((item) => item.id));
+      this.renderPanelEntries(this.hasSearchQuery() ? this.entries.filter(({ item }) => valid.has(item.id))
+        : this.items.map((item) => ({ item, ranges: [] })));
+    }
+
+    appendHighlight(target, text, ranges, start, end) {
+      let cursor = start;
+      const append = (value, marked) => {
+        if (!value) return;
+        const span = document.createElement(marked ? 'mark' : 'span');
+        span.textContent = value;
+        target.append(span);
+      };
+      for (const range of ranges) {
+        const a = Math.max(start, range.start);
+        const b = Math.min(end, range.end);
+        if (b <= a) continue;
+        append(text.slice(cursor, a), false);
+        append(text.slice(a, b), true);
+        cursor = b;
+      }
+      append(text.slice(cursor, end), false);
+    }
+
+    previewMetrics() {
+      const probe = this.previewProbe.firstElementChild;
+      const style = getComputedStyle(probe);
+      const button = getComputedStyle(this.previewProbe);
+      const mark = getComputedStyle(probe.firstElementChild);
+      const size = parseFloat(style.fontSize) || CONFIG.promptFontSizePx;
+      const spacing = parseFloat(style.letterSpacing) || 0;
+      const family = style.fontFamily || 'system-ui, sans-serif';
+      const normalFont = `${style.fontWeight || 440} ${size}px ${family}`;
+      const markedFont = `${mark.fontWeight || 600} ${size}px ${family}`;
+      const leftPadding = parseFloat(button.paddingLeft);
+      const rightPadding = parseFloat(button.paddingRight);
+      const padding = (Number.isFinite(leftPadding) ? leftPadding : 8)
+        + (Number.isFinite(rightPadding) ? rightPadding : 8);
+      const panelWidth = this.panel.clientWidth || Math.min(CONFIG.panelWidthPx, (window.innerWidth || CONFIG.panelWidthPx + 40) - 40);
+      if (this.previewContext === undefined) {
+        try { this.previewContext = document.createElement('canvas').getContext?.('2d') ?? null; }
+        catch { this.previewContext = null; }
+      }
+      const approximate = (value) => Array.from(value).reduce((total, character) => total
+        + (/\p{M}|\u200D/u.test(character) ? 0 : /[^\u0000-\u00ff]/u.test(character) ? size : size * .54), 0);
+      return {
+        width: Math.max(24, panelWidth - 2 * CONFIG.panelPaddingPx - padding),
+        measure: cachedPreviewMeasure((value, highlighted = false) => {
+          if (!value) return 0;
+          if (this.previewContext) {
+            try {
+              this.previewContext.font = highlighted ? markedFont : normalFont;
+              return this.previewContext.measureText(value).width + spacing * Math.max(0, Array.from(value).length - 1);
+            } catch { this.previewContext = null; }
+          }
+          return approximate(value);
+        }),
+      };
+    }
+
+    makePreview(item, ranges, metrics = null) {
+      const preview = document.createElement('span');
+      preview.className = `${NS}__preview`;
+      if (!ranges.length) {
+        preview.textContent = item.text;
+        return preview;
+      }
+      const excerpt = searchPreview(item.text, ranges, metrics ?? this.previewMetrics());
+      const appendEllipsis = (value) => {
+        const span = document.createElement('span');
+        span.textContent = value;
+        preview.append(span);
+      };
+      if (excerpt.start > 0) appendEllipsis('… ');
+      this.appendHighlight(preview, item.text, ranges, excerpt.start, excerpt.end);
+      if (excerpt.end < item.text.length) appendEllipsis(' …');
+      return preview;
+    }
+
+    refreshPreviews() {
+      if (this.destroyed || !this.hasSearchQuery()) return;
+      const metrics = this.previewMetrics();
+      for (const { item, ranges } of this.entries) {
+        if (!ranges.length) continue;
+        this.panelById.get(item.id)?.firstElementChild
+          ?.replaceChildren(this.makePreview(item, ranges, metrics));
+      }
+    }
+
+    renderPanelEntries(entries) {
+      const focusedId = this.shadow.activeElement?.dataset.messageId;
+      this.entries = entries;
+      const fragment = document.createDocumentFragment();
+      const byId = new Map();
+      const metrics = entries.some(({ ranges }) => ranges.length) ? this.previewMetrics() : null;
+      for (const { item, ranges } of entries) {
+        const row = document.createElement('li');
+        row.className = `${NS}__panel-row`;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `${NS}__panel-item`;
+        button.dataset.messageId = item.id;
+        button.setAttribute('aria-label', item.text);
+        button.append(this.makePreview(item, ranges, metrics));
+        row.append(button);
+        fragment.append(row);
+        byId.set(item.id, row);
+      }
+      this.emptyNotice = null;
+      if (!entries.length && this.query) {
+        this.emptyNotice = document.createElement('li');
+        this.emptyNotice.className = `${NS}__empty`;
+        fragment.append(this.emptyNotice);
+      }
+      this.panelList.replaceChildren(fragment);
+      this.panelById = byId;
       this.highlightedPanelRow = null;
       this.hoveredPanelRow = null;
-      if (replaceRail) this.highlightedRailRow = null;
-      if (!panelById.has(this.hoverId)) this.hoverId = null;
+      if (!byId.has(this.hoverId)) this.hoverId = null;
       this.applyVisuals();
+      this.updateSearchNotice();
+      if (focusedId && this.open) {
+        if (byId.has(focusedId)) byId.get(focusedId).firstElementChild.focus({ preventScroll: true });
+        else if (this.searchVisible) this.searchInput.focus({ preventScroll: true });
+      }
+    }
+
+    panelAnchor() {
+      const index = Math.max(0, Math.floor((this.panel.scrollTop - CONFIG.panelPaddingPx) / CONFIG.panelRowHeightPx));
+      return { id: this.entries[index]?.item.id, offset: this.panel.scrollTop - index * CONFIG.panelRowHeightPx };
+    }
+
+    restorePanelAnchor(anchor) {
+      const index = this.entries.findIndex(({ item }) => item.id === anchor?.id);
+      this.panel.scrollTop = index >= 0 ? index * CONFIG.panelRowHeightPx + anchor.offset : 0;
+    }
+
+    revealSearchForPointer() {
+      if (!this.open) return;
+      this.pointerInSearch = true;
+      this.cancelSearchRetraction();
+      this.setSearchVisible(true);
+      if (this.shadow.activeElement === this.searchInput) return;
+      this.hoverFocus = { previous: this.shadow.activeElement ?? document.activeElement };
+      this.searchInput.focus({ preventScroll: true });
+    }
+
+    releaseHoverFocus() {
+      const previous = this.hoverFocus?.previous;
+      const ownsFocus = this.hoverFocus && this.shadow.activeElement === this.searchInput;
+      this.hoverFocus = null;
+      if (!ownsFocus) return;
+      this.searchInput.blur();
+      if (previous?.isConnected && previous !== this.host && !this.dock.contains(previous)) {
+        previous.focus?.({ preventScroll: true });
+      }
+    }
+
+    startSearchSession() {
+      this.searchSessionStarted = true;
+      this.hoverFocus = null;
+      this.cancelSearchRetraction();
+    }
+
+    cancelSearchRetraction() {
+      window.clearTimeout(this.searchRetractTimer);
+      this.searchRetractTimer = 0;
+    }
+
+    scheduleSearchRetraction() {
+      this.cancelSearchRetraction();
+      if (this.destroyed || !this.open || !this.searchVisible || this.searchSessionStarted) return;
+      this.searchRetractTimer = window.setTimeout(() => {
+        this.searchRetractTimer = 0;
+        if (this.pointerInSearch || this.searchSessionStarted || this.composing) return;
+        // Keyboard focus remains usable even when the mouse is elsewhere.
+        // An unused pointer focus is transient and can be returned safely.
+        if (this.searchField.contains(this.shadow.activeElement) && !this.hoverFocus) return;
+        this.setSearchVisible(false);
+      }, SEARCH.retractDelayMs);
+    }
+
+    setSearchVisible(visible, focus = false) {
+      this.cancelSearchRetraction();
+      this.searchVisible = visible;
+      if (!visible) {
+        this.releaseHoverFocus();
+        if (this.searchField.contains(this.shadow.activeElement)) this.shadow.activeElement.blur();
+      }
+      focus ||= visible && this.shadow.activeElement === this.searchButton;
+      this.searchShelf.classList.toggle(`${NS}__search-shelf--expanded`, visible);
+      this.searchField.inert = !visible;
+      this.searchField.setAttribute('aria-hidden', String(!visible));
+      this.searchButton.tabIndex = visible ? -1 : 0;
+      this.searchButton.setAttribute('aria-hidden', String(visible));
+      this.searchButton.setAttribute('aria-expanded', String(visible));
+      if (visible && focus) this.searchInput.focus({ preventScroll: true });
+    }
+
+    cancelSearch() {
+      this.searchSequence += 1;
+      this.searchController?.abort();
+      this.searchController = null;
+      this.searchSoon.cancel();
+      this.searchPending = false;
+    }
+
+    hasSearchQuery() {
+      return isSearchQuery(searchDocument(this.query));
+    }
+
+    setQuery(value) {
+      value = String(value).slice(0, SEARCH.inputMaxLength);
+      this.searchInput.value = value;
+      const next = normalizeText(value);
+      if (next === this.query) return;
+      const wasSearching = this.hasSearchQuery();
+      const willSearch = isSearchQuery(searchDocument(next));
+      if (!wasSearching && willSearch) this.normalAnchor = this.panelAnchor();
+      this.query = next;
+      this.clearButton.hidden = !next;
+      this.searchError = false;
+      if (!willSearch) {
+        this.cancelSearch();
+        if (wasSearching) {
+          this.renderPanelEntries(this.items.map((item) => ({ item, ranges: [] })));
+          this.restorePanelAnchor(this.normalAnchor);
+        }
+        this.normalAnchor = null;
+        this.updateSearchNotice();
+      } else this.queueSearch();
+    }
+
+    queueSearch(preservePosition = false) {
+      this.cancelSearch();
+      this.preserveSearchPosition = preservePosition;
+      this.searchPending = true;
+      this.updateSearchNotice();
+      this.searchSoon();
+    }
+
+    async runSearch() {
+      if (!this.hasSearchQuery() || this.destroyed) return;
+      const controller = new AbortController();
+      this.searchController = controller;
+      const sequence = this.searchSequence;
+      try {
+        const results = await this.search.find(this.query, controller.signal);
+        if (this.destroyed || controller.signal.aborted || sequence !== this.searchSequence) return;
+        const anchor = this.preserveSearchPosition ? this.panelAnchor() : null;
+        this.searchPending = false;
+        this.renderPanelEntries(results);
+        this.restorePanelAnchor(anchor);
+      } catch (error) {
+        if (isAbortError(error) || this.destroyed || sequence !== this.searchSequence) return;
+        this.searchPending = false;
+        this.searchError = true;
+        this.renderPanelEntries([]);
+        console.warn(`[${NS}] Prompt search failed.`, error);
+      } finally {
+        if (this.searchController === controller) this.searchController = null;
+      }
+    }
+
+    updateSearchNotice() {
+      this.panel.setAttribute('aria-busy', String(this.searchPending || this.loadStatus === 'loading'));
+      // Keep existing keyboard focus stable while results are recomputed.
+      // Activation is guarded in the delegated click handler until ready.
+      this.panelList.setAttribute('aria-busy', String(this.searchPending));
+      if (!this.hasSearchQuery()) {
+        if (this.announcer) this.announcer.textContent = '';
+        return;
+      }
+      const incomplete = this.loadStatus === 'loading' || this.loadStatus === 'partial';
+      const notice = this.searchPending ? 'Searching…' : this.searchError ? 'Search unavailable'
+        : this.entries.length ? `${this.entries.length} matching ${this.entries.length === 1 ? 'prompt' : 'prompts'}`
+          : incomplete ? 'No matches in loaded prompts' : 'No matching prompts';
+      if (this.announcer) this.announcer.textContent = notice;
+      if (this.emptyNotice) this.emptyNotice.textContent = notice;
     }
 
     visiblePanelRows() {
-      const space = Math.max(1, window.innerHeight - 32 - 2 * CONFIG.panelPaddingPx);
+      const space = Math.max(1, window.innerHeight - 32 - 2 * SEARCH.shelfHeightPx - 2 * CONFIG.panelPaddingPx);
       return Math.max(1, Math.min(
         this.items.length,
         CONFIG.panelVisibleRows,
@@ -1280,6 +2270,7 @@
         this.visiblePanelRows() * CONFIG.panelRowHeightPx + 2 * CONFIG.panelPaddingPx,
       );
       this.dock.style.setProperty(`--${NS}-panel-height`, `${panelHeight}px`);
+      if (this.hasSearchQuery()) this.previewRefreshSoon();
     }
 
     setHover(messageId) {
@@ -1289,7 +2280,7 @@
     }
 
     onWheel(event) {
-      if (!this.open || this.items.length <= 1) return;
+      if (!this.open || event.ctrlKey) return;
       event.preventDefault();
       const multiplier = event.deltaMode === 1 ? 16 : event.deltaMode === 2
         ? this.panel.clientHeight : 1;
@@ -1324,6 +2315,15 @@
     }
 
     clear() {
+      this.cancelSearchRetraction();
+      this.searchSessionStarted = false;
+      this.pointerInSearch = false;
+      this.previewRefreshSoon.cancel();
+      this.cancelSearch();
+      this.query = '';
+      this.searchError = false;
+      this.composing = false;
+      this.normalAnchor = null;
       this.signature = null;
       this.activeId = null;
       this.railSlot = -1;
@@ -1331,8 +2331,18 @@
     }
 
     destroy() {
+      this.destroyed = true;
+      this.cancelSearchRetraction();
+      this.searchSessionStarted = false;
+      this.releaseHoverFocus();
+      this.previewRefreshSoon.cancel();
+      document.fonts?.removeEventListener('loadingdone', this.onFontsReady);
+      this.previewContext = null;
+      this.cancelSearch();
+      this.search.clear();
       window.clearTimeout(this.closeTimer);
       this.host.remove();
+      this.entries = [];
       this.items = [];
       this.panelById?.clear();
     }
